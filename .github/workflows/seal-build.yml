@@ -1,0 +1,97 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test arguments selecting a subset of tests (empty = full suite)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # go.mod declares go 1.24.0; on Go 1.24 the http2 and internal/http3
+      # tests are gated on `goexperiment.synctest` and are otherwise dropped
+      # (internal/http3 then fails to compile).
+      GOEXPERIMENT: synctest
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      # -v makes the runner print one result line per test so the log states
+      # how many tests passed; the summary below totals them.
+      - name: Test
+        run: |
+          set -eux -o pipefail
+          go test -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+          awk '/^ *--- PASS/{p++} /^ *--- SKIP/{s++} /^ *--- FAIL/{f++} /^ok /{ok++} END{printf "TEST SUMMARY: %d tests passed, %d skipped, %d failed; %d packages ok\n", p, s, f, ok}' "$RUNNER_TEMP/go-test.log"
